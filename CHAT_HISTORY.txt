@@ -1,0 +1,155 @@
+================================================================================
+EMAIL TRIAGE OPENENV ENVIRONMENT — DEVELOPMENT CHAT HISTORY
+================================================================================
+Date: March 29, 2026
+Project: OpenEnv Hackathon Submission — Email Triage Environment
+
+================================================================================
+PHASE 1: REPOSITORY CLONING & RESEARCH
+================================================================================
+
+1. Cloned the OpenEnv framework repo from:
+   https://github.com/meta-pytorch/OpenEnv
+   into the local folder: openEnv/
+
+2. Studied the entire OpenEnv codebase in depth:
+   - src/openenv/core/env_server/interfaces.py  → Environment base class (ABC)
+   - src/openenv/core/env_server/types.py        → Action, Observation, State base models
+   - src/openenv/core/client_types.py            → StepResult dataclass
+   - src/openenv/core/env_client.py              → EnvClient (WebSocket client)
+   - src/openenv/core/rubrics/base.py            → Rubric base class for grading
+   - src/openenv/core/env_server/http_server.py  → HTTPEnvServer + create_app()
+   - src/openenv/core/env_server/serialization.py→ serialize/deserialize helpers
+   - envs/echo_env/                              → Simple reference environment
+   - envs/coding_env/                            → Complex reference environment
+   - docs/environment-builder.md                 → Official build guide
+
+3. Key findings from the framework:
+   - Environment must extend Environment[ActT, ObsT, StateT]
+   - Must implement: reset(), step(), state (property)
+   - Models must extend Action, Observation, State (Pydantic BaseModel)
+   - Observation has built-in fields: done (bool), reward (float|None), metadata (dict)
+   - serialize_observation() strips done/reward from obs dict, puts them at top level
+   - HTTP endpoints are stateless (new env per request)
+   - WebSocket /ws endpoint is stateful (session-based)
+   - openenv.yaml is the manifest file
+   - create_app(EnvClass, ActionClass, ObsClass, env_name) creates the FastAPI app
+
+================================================================================
+PHASE 2: ENVIRONMENT DESIGN DECISIONS
+================================================================================
+
+Chose: EMAIL TRIAGE — a real-world task where agents classify, prioritize,
+and draft replies for customer support emails.
+
+Why this task:
+- Genuinely real-world (support teams do this daily)
+- Not a game or toy
+- Natural difficulty scaling (clear emails → ambiguous → complex)
+- Rich action space (priority + category + reply text + escalation flag)
+- Supports partial credit scoring across multiple dimensions
+
+Task structure:
+- 3 tasks × 3 emails each = 9 total emails
+- easy_triage:   Clear signals (login issue, feature request, billing question)
+- medium_triage: Ambiguous (performance bug, partnership inquiry, follow-up invoice)
+- hard_triage:   Complex (production data loss + legal threat, spam detection,
+                 mixed bug+feature thread with history)
+
+Grading dimensions (per email, total 1.0):
+- Priority match:   0.30 (exact=0.30, adjacent=0.15, else 0)
+- Category match:   0.30 (exact=0.30, else 0)
+- Escalation match: 0.15 (correct=0.15, else 0)
+- Reply quality:    0.25 (keyword coverage ratio)
+- Penalty: replies < 3 words lose 0.1
+
+================================================================================
+PHASE 3: FILES CREATED
+================================================================================
+
+Project root:
+  Dockerfile                          — Docker build for HF Spaces deployment
+  inference.py                        — Baseline inference script (OpenAI client)
+
+email_triage_env/:
+  __init__.py                         — Package exports
+  models.py                           — EmailAction, EmailObservation, EmailState
+  client.py                           — EmailTriageEnv (EnvClient subclass)
+  openenv.yaml                        — OpenEnv manifest
+  pyproject.toml                      — Package dependencies
+  README.md                           — Full documentation
+
+email_triage_env/server/:
+  __init__.py                         — Server package
+  app.py                              — FastAPI app via create_app()
+  email_triage_environment.py         — EmailTriageEnvironment (main env logic)
+  grader.py                           — grade_single_email() deterministic scorer
+  tasks.py                            — Email/Task dataclasses
+  task_data.py                        — 9 emails across 3 tasks with ground truth
+  Dockerfile                          — Alternative Dockerfile (inside server/)
+
+================================================================================
+PHASE 4: TESTING & VALIDATION
+================================================================================
+
+Test 1: Direct Python — Environment logic
+  - Created EmailTriageEnvironment, called reset(task_id="easy_triage")
+  - Stepped through all 3 emails with correct answers
+  - Result: All scored 1.0, average 1.0 ✅
+
+Test 2: Direct Python — Partial scoring (hard task)
+  - Reset with hard_triage, gave intentionally wrong answers
+  - Step 1 (wrong priority+category+no escalation): reward = 0.0 ✅
+  - Step 2 (correct spam detection): reward = 1.0 ✅
+  - Step 3 (partially correct): reward = 0.6667 ✅
+  - Average: 0.6667 — partial credit works ✅
+
+Test 3: HTTP Server — FastAPI endpoints
+  - Started uvicorn on port 8000
+  - GET /health → {"status": "healthy"} ✅
+  - POST /reset → Returns initial observation with email subject ✅
+  - Note: HTTP reset/step are stateless (each creates new env instance)
+
+Test 4: WebSocket — Stateful sessions
+  - Connected to ws://localhost:8000/ws
+  - Sent reset, got first email observation ✅
+  - Sent step with correct action, got reward=1.0 and next email ✅
+  - State maintained across messages within same WS connection ✅
+
+Test 5: Full E2E — All 3 tasks with default actions
+  - easy_triage with "medium/general_inquiry" defaults: score=0.2500 ✅
+  - medium_triage with same defaults: score=0.4000 ✅
+  - hard_triage with same defaults: score=0.2000 ✅
+  - Scores differentiate by difficulty as expected ✅
+
+================================================================================
+PHASE 5: KEY TECHNICAL DETAILS
+================================================================================
+
+Serialization format (from OpenEnv framework):
+  Response = {"data": {"observation": {...}, "reward": float, "done": bool}}
+  The "done" and "reward" fields are EXCLUDED from the observation dict
+  and placed at the envelope level by serialize_observation().
+
+WebSocket protocol:
+  Reset:  {"type": "reset", "data": {"task_id": "easy_triage"}}
+  Step:   {"type": "step", "data": {"priority": "...", "category": "...", ...}}
+  State:  {"type": "state"}  (no data field)
+
+Inference script:
+  - Uses OpenAI client with API_BASE_URL, MODEL_NAME, HF_TOKEN env vars
+  - Connects via WebSocket for stateful sessions
+  - System prompt instructs LLM to output JSON with priority/category/reply/escalate
+  - Parses JSON from LLM response (handles markdown fences)
+  - Sanitizes action fields to valid enum values
+  - Runs all 3 tasks sequentially, prints per-task and average scores
+
+================================================================================
+PHASE 6: REMAINING DEPLOYMENT STEPS
+================================================================================
+
+See DEPLOYMENT_AND_TESTING_GUIDE.txt for detailed instructions.
+
+================================================================================
+END OF CHAT HISTORY
+================================================================================

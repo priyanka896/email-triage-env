@@ -1,0 +1,525 @@
+================================================================================
+EMAIL TRIAGE OPENENV — TESTING, VALIDATION & DEPLOYMENT GUIDE
+================================================================================
+
+================================================================================
+PART 1: LOCAL TESTING (Accuracy & Correctness)
+================================================================================
+
+PREREQUISITES:
+  Python 3.10+ (3.11 recommended)
+  pip install openenv-core fastapi pydantic "uvicorn[standard]" openai websockets
+
+------------------------------------------------------------------------
+TEST A: Unit Test — Environment Logic (No Server Needed)
+------------------------------------------------------------------------
+
+Run this to verify the environment logic, grading, and all 3 tasks:
+
+  python test_all.py
+
+Create test_all.py with the content below, then run it:
+
+--- START test_all.py ---
+import sys
+sys.path.insert(0, ".")
+
+from email_triage_env.models import EmailAction, EmailObservation, EmailState
+from email_triage_env.models import Priority, Category
+from email_triage_env.server.email_triage_environment import EmailTriageEnvironment
+
+def test_easy_task():
+    env = EmailTriageEnvironment()
+    obs = env.reset(task_id="easy_triage")
+
+    assert obs.task_id == "easy_triage"
+    assert obs.email_subject == "Cannot log in to my account"
+    assert obs.emails_remaining == 3
+    assert obs.done is False
+    print("[PASS] Easy task reset")
+
+    # Email 1: Login issue → urgent, account_access
+    obs = env.step(EmailAction(
+        priority=Priority.URGENT,
+        category=Category.ACCOUNT_ACCESS,
+        reply="I understand you cannot log in. Let me help reset your password and restore account access.",
+        escalate=False,
+    ))
+    assert obs.reward == 1.0, f"Expected 1.0, got {obs.reward}"
+    print(f"[PASS] Easy email 1: reward={obs.reward}")
+
+    # Email 2: Dark mode → low, feature_request
+    obs = env.step(EmailAction(
+        priority=Priority.LOW,
+        category=Category.FEATURE_REQUEST,
+        reply="Thanks for the feature request! We will add dark mode to our roadmap.",
+        escalate=False,
+    ))
+    assert obs.reward == 1.0, f"Expected 1.0, got {obs.reward}"
+    print(f"[PASS] Easy email 2: reward={obs.reward}")
+
+    # Email 3: Billing charge → high, billing
+    obs = env.step(EmailAction(
+        priority=Priority.HIGH,
+        category=Category.BILLING,
+        reply="I see the charge on your account. Let me look into this billing issue.",
+        escalate=False,
+    ))
+    assert obs.done is True
+    assert obs.reward == 1.0, f"Expected avg 1.0, got {obs.reward}"
+    print(f"[PASS] Easy email 3 (final): avg_reward={obs.reward}")
+    print(f"[PASS] Easy task complete. State: steps={env.state.step_count}")
+
+
+def test_medium_task():
+    env = EmailTriageEnvironment()
+    obs = env.reset(task_id="medium_triage")
+
+    assert obs.task_id == "medium_triage"
+    assert obs.emails_remaining == 3
+    print("[PASS] Medium task reset")
+
+    # Email 1: Performance bug → high, bug_report
+    obs = env.step(EmailAction(
+        priority=Priority.HIGH,
+        category=Category.BUG_REPORT,
+        reply="We are investigating the performance issue after the update. We will keep you posted.",
+        escalate=False,
+    ))
+    assert obs.reward > 0.8, f"Expected >0.8, got {obs.reward}"
+    print(f"[PASS] Medium email 1: reward={obs.reward}")
+
+    # Email 2: Partnership → medium, general_inquiry, escalate=True
+    obs = env.step(EmailAction(
+        priority=Priority.MEDIUM,
+        category=Category.GENERAL_INQUIRY,
+        reply="Thank you for the partnership opportunity. Let me schedule a call with our team.",
+        escalate=True,
+    ))
+    assert obs.reward > 0.8, f"Expected >0.8, got {obs.reward}"
+    print(f"[PASS] Medium email 2: reward={obs.reward}")
+
+    # Email 3: Invoice follow-up → high, billing
+    obs = env.step(EmailAction(
+        priority=Priority.HIGH,
+        category=Category.BILLING,
+        reply="I apologize for the delay. The invoice amount will be corrected to the agreed amount.",
+        escalate=False,
+    ))
+    assert obs.done is True
+    assert obs.reward > 0.7, f"Expected avg >0.7, got {obs.reward}"
+    print(f"[PASS] Medium email 3 (final): avg_reward={obs.reward}")
+
+
+def test_hard_task():
+    env = EmailTriageEnvironment()
+    obs = env.reset(task_id="hard_triage")
+
+    assert obs.task_id == "hard_triage"
+    print("[PASS] Hard task reset")
+
+    # Email 1: Data loss → urgent, bug_report, escalate=True
+    obs = env.step(EmailAction(
+        priority=Priority.URGENT,
+        category=Category.BUG_REPORT,
+        reply="This is being escalated immediately. Our team will provide immediate assistance with the data loss.",
+        escalate=True,
+    ))
+    assert obs.reward > 0.8, f"Expected >0.8, got {obs.reward}"
+    print(f"[PASS] Hard email 1: reward={obs.reward}")
+
+    # Email 2: Spam → low, spam
+    obs = env.step(EmailAction(
+        priority=Priority.LOW,
+        category=Category.SPAM,
+        reply="This email has been identified as spam and will be discarded.",
+        escalate=False,
+    ))
+    assert obs.reward > 0.9, f"Expected >0.9, got {obs.reward}"
+    print(f"[PASS] Hard email 2: reward={obs.reward}")
+
+    # Email 3: CSV bug + PDF request → high, bug_report
+    obs = env.step(EmailAction(
+        priority=Priority.HIGH,
+        category=Category.BUG_REPORT,
+        reply="We are fixing the CSV export UTF-8 encoding issue. PDF export is noted for the roadmap.",
+        escalate=False,
+    ))
+    assert obs.done is True
+    assert obs.reward > 0.7, f"Expected avg >0.7, got {obs.reward}"
+    print(f"[PASS] Hard email 3 (final): avg_reward={obs.reward}")
+
+
+def test_partial_scoring():
+    """Verify partial credit works correctly."""
+    env = EmailTriageEnvironment()
+    env.reset(task_id="easy_triage")
+
+    # Completely wrong answer
+    obs = env.step(EmailAction(
+        priority=Priority.LOW,
+        category=Category.SPAM,
+        reply="ok",
+        escalate=True,
+    ))
+    assert obs.reward < 0.2, f"Wrong answer should score low, got {obs.reward}"
+    print(f"[PASS] Partial scoring — wrong answer: reward={obs.reward}")
+
+    # Adjacent priority (medium instead of low)
+    obs = env.step(EmailAction(
+        priority=Priority.MEDIUM,
+        category=Category.FEATURE_REQUEST,
+        reply="Thanks for the feature request!",
+        escalate=False,
+    ))
+    assert 0.5 < obs.reward < 1.0, f"Adjacent should get partial, got {obs.reward}"
+    print(f"[PASS] Partial scoring — adjacent priority: reward={obs.reward}")
+
+
+def test_state():
+    """Verify state tracking."""
+    env = EmailTriageEnvironment()
+    env.reset(task_id="easy_triage")
+
+    assert env.state.step_count == 0
+    assert env.state.current_email_index == 0
+    assert env.state.total_emails == 3
+
+    env.step(EmailAction(
+        priority=Priority.URGENT,
+        category=Category.ACCOUNT_ACCESS,
+        reply="Resetting your password and account access now.",
+        escalate=False,
+    ))
+
+    assert env.state.step_count == 1
+    assert env.state.current_email_index == 1
+    assert env.state.cumulative_reward > 0
+    print(f"[PASS] State tracking: steps={env.state.step_count}, cumulative={env.state.cumulative_reward}")
+
+
+def test_reset_clears_state():
+    """Verify reset clears previous episode."""
+    env = EmailTriageEnvironment()
+    env.reset(task_id="easy_triage")
+    env.step(EmailAction(
+        priority=Priority.URGENT,
+        category=Category.ACCOUNT_ACCESS,
+        reply="Resetting your password now.",
+        escalate=False,
+    ))
+    assert env.state.step_count == 1
+
+    # Reset should clear everything
+    obs = env.reset(task_id="medium_triage")
+    assert env.state.step_count == 0
+    assert env.state.current_email_index == 0
+    assert obs.task_id == "medium_triage"
+    print("[PASS] Reset clears state correctly")
+
+
+def test_invalid_task_fallback():
+    """Verify invalid task_id falls back to easy."""
+    env = EmailTriageEnvironment()
+    obs = env.reset(task_id="nonexistent_task")
+    assert obs.task_id == "easy_triage"
+    print("[PASS] Invalid task_id falls back to easy_triage")
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  EMAIL TRIAGE ENVIRONMENT — UNIT TESTS")
+    print("=" * 60)
+
+    test_easy_task()
+    print()
+    test_medium_task()
+    print()
+    test_hard_task()
+    print()
+    test_partial_scoring()
+    print()
+    test_state()
+    print()
+    test_reset_clears_state()
+    print()
+    test_invalid_task_fallback()
+
+    print()
+    print("=" * 60)
+    print("  ALL TESTS PASSED")
+    print("=" * 60)
+--- END test_all.py ---
+
+
+------------------------------------------------------------------------
+TEST B: Server Test — HTTP + WebSocket Endpoints
+------------------------------------------------------------------------
+
+1. Start the server:
+     python -m uvicorn email_triage_env.server.app:app --host 0.0.0.0 --port 8000
+
+2. In another terminal, run these checks:
+
+   a) Health check:
+        curl http://localhost:8000/health
+        Expected: {"status":"healthy"}
+
+   b) Schema check:
+        curl http://localhost:8000/schema
+        Expected: JSON with action/observation/state schemas
+
+   c) WebSocket full flow (save as test_ws.py and run):
+
+--- START test_ws.py ---
+import asyncio
+import json
+import websockets
+
+async def test_websocket():
+    for task_id in ["easy_triage", "medium_triage", "hard_triage"]:
+        async with websockets.connect("ws://localhost:8000/ws") as ws:
+            # Reset
+            await ws.send(json.dumps({"type": "reset", "data": {"task_id": task_id}}))
+            resp = json.loads(await ws.recv())
+            envelope = resp["data"]
+            obs = envelope["observation"]
+            done = envelope.get("done", False)
+
+            print(f"\nTask: {task_id}")
+            print(f"  First email: {obs['email_subject']}")
+
+            step = 0
+            while not done:
+                action = {
+                    "priority": "medium",
+                    "category": "general_inquiry",
+                    "reply": "Thank you for contacting us. We are looking into this.",
+                    "escalate": False,
+                }
+                await ws.send(json.dumps({"type": "step", "data": action}))
+                resp = json.loads(await ws.recv())
+                envelope = resp["data"]
+                obs = envelope["observation"]
+                reward = envelope.get("reward", 0)
+                done = envelope.get("done", False)
+                step += 1
+                print(f"  Step {step}: reward={reward:.4f}, done={done}")
+
+            print(f"  Final score: {envelope['reward']:.4f}")
+
+asyncio.run(test_websocket())
+--- END test_ws.py ---
+
+
+------------------------------------------------------------------------
+TEST C: Docker Build Test
+------------------------------------------------------------------------
+
+From the project root (where Dockerfile is):
+
+  docker build -t email-triage-env .
+  docker run -p 8000:8000 email-triage-env
+
+Then repeat Test B checks against http://localhost:8000
+
+
+------------------------------------------------------------------------
+TEST D: Inference Script Test (requires LLM API access)
+------------------------------------------------------------------------
+
+  export API_BASE_URL="https://router.huggingface.co/v1"
+  export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"   # or any model you have access to
+  export HF_TOKEN="hf_your_token_here"
+  export ENV_URL="http://localhost:8000"
+
+  python inference.py
+
+Expected output:
+  - Runs all 3 tasks (easy, medium, hard)
+  - Prints per-step actions and rewards
+  - Prints final summary with scores in 0.0-1.0 range
+  - Completes in under 20 minutes
+  - No errors
+
+
+================================================================================
+PART 2: OPENENV VALIDATION
+================================================================================
+
+Install the OpenEnv CLI:
+  pip install openenv-core
+
+Run validation (with server running on port 8000):
+  openenv validate email_triage_env/
+
+This checks:
+  - openenv.yaml exists and is valid
+  - Typed models are proper Pydantic subclasses
+  - step()/reset()/state() endpoints respond correctly
+  - Action/observation schemas are valid
+
+
+================================================================================
+PART 3: DEPLOYMENT TO HUGGING FACE SPACES
+================================================================================
+
+------------------------------------------------------------------------
+STEP 1: Install Hugging Face CLI
+------------------------------------------------------------------------
+
+  pip install huggingface_hub
+
+------------------------------------------------------------------------
+STEP 2: Login to Hugging Face
+------------------------------------------------------------------------
+
+  huggingface-cli login
+  # Paste your HF token when prompted (get one at https://huggingface.co/settings/tokens)
+
+------------------------------------------------------------------------
+STEP 3: Create a New Space
+------------------------------------------------------------------------
+
+  huggingface-cli repo create email-triage-env --type space --space-sdk docker
+
+  This creates: https://huggingface.co/spaces/YOUR_USERNAME/email-triage-env
+
+------------------------------------------------------------------------
+STEP 4: Clone the Space Repo
+------------------------------------------------------------------------
+
+  git clone https://huggingface.co/spaces/YOUR_USERNAME/email-triage-env hf-space
+  cd hf-space
+
+------------------------------------------------------------------------
+STEP 5: Copy Your Project Files
+------------------------------------------------------------------------
+
+  Copy these into the hf-space/ folder:
+    - Dockerfile              (from project root)
+    - inference.py            (from project root)
+    - email_triage_env/       (entire folder)
+
+  DO NOT copy:
+    - openEnv/                (that's the reference framework repo)
+    - __pycache__/            (Python cache)
+    - .git/                   (git internals)
+
+  Your hf-space/ should look like:
+    hf-space/
+    ├── Dockerfile
+    ├── inference.py
+    └── email_triage_env/
+        ├── __init__.py
+        ├── client.py
+        ├── models.py
+        ├── openenv.yaml
+        ├── pyproject.toml
+        ├── README.md
+        └── server/
+            ├── __init__.py
+            ├── app.py
+            ├── email_triage_environment.py
+            ├── grader.py
+            ├── task_data.py
+            └── tasks.py
+
+------------------------------------------------------------------------
+STEP 6: Push to Hugging Face
+------------------------------------------------------------------------
+
+  cd hf-space
+  git add .
+  git commit -m "Email Triage OpenEnv environment"
+  git push
+
+  Wait for the Space to build (check the Logs tab on HF).
+
+------------------------------------------------------------------------
+STEP 7: Verify Deployment
+------------------------------------------------------------------------
+
+  Once the Space is running:
+
+  a) Health check:
+       curl https://YOUR_USERNAME-email-triage-env.hf.space/health
+       Expected: {"status":"healthy"}
+
+  b) Reset check:
+       curl -X POST https://YOUR_USERNAME-email-triage-env.hf.space/reset \
+         -H "Content-Type: application/json" \
+         -d '{"task_id": "easy_triage"}'
+
+  c) Run inference against deployed Space:
+       export ENV_URL="https://YOUR_USERNAME-email-triage-env.hf.space"
+       export API_BASE_URL="https://router.huggingface.co/v1"
+       export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+       export HF_TOKEN="hf_your_token"
+       python inference.py
+
+------------------------------------------------------------------------
+STEP 8: Push to GitHub
+------------------------------------------------------------------------
+
+  Create a new GitHub repo, then:
+
+  git init
+  git add Dockerfile inference.py email_triage_env/
+  git commit -m "Email Triage OpenEnv environment for hackathon"
+  git remote add origin https://github.com/YOUR_USERNAME/email-triage-env.git
+  git push -u origin main
+
+------------------------------------------------------------------------
+STEP 9: Run Pre-Submission Validator
+------------------------------------------------------------------------
+
+  If the hackathon provides a validation script:
+
+  curl -fsSL https://raw.githubusercontent.com/meta-pytorch/OpenEnv/main/scripts/validate-submission.sh \
+    | bash -s -- https://YOUR_USERNAME-email-triage-env.hf.space .
+
+  This checks:
+    - Space returns 200 and responds to reset()
+    - openenv.yaml is valid
+    - Dockerfile builds
+    - inference.py runs without errors
+    - 3+ tasks with graders producing 0.0-1.0 scores
+
+------------------------------------------------------------------------
+STEP 10: Submit
+------------------------------------------------------------------------
+
+  Paste these two URLs in the submission form:
+    - GitHub Repository URL:    https://github.com/YOUR_USERNAME/email-triage-env
+    - Hugging Face Space URL:   https://huggingface.co/spaces/YOUR_USERNAME/email-triage-env
+
+
+================================================================================
+PART 4: TROUBLESHOOTING
+================================================================================
+
+Problem: Docker build fails with "openenv-core not found"
+  → Make sure pyproject.toml has: openenv-core>=0.2.2 in dependencies
+
+Problem: WebSocket connection refused on HF Space
+  → HF Spaces may need the URL format: wss://YOUR_USERNAME-email-triage-env.hf.space/ws
+  → Check Space logs for startup errors
+
+Problem: inference.py times out
+  → Increase MAX_STEPS if needed (default 10)
+  → Check that ENV_URL points to the correct running server
+  → Verify your HF_TOKEN has API access to the model
+
+Problem: openenv validate fails
+  → Ensure openenv.yaml is in the email_triage_env/ directory
+  → Ensure server is running when you run validate
+
+Problem: Scores are all 0.0
+  → Check that the LLM is returning valid JSON
+  → Set DEBUG=True in inference.py to see raw LLM responses
+  → Verify the model name is correct and accessible
+
+================================================================================
+END OF GUIDE
+================================================================================
