@@ -5,7 +5,7 @@ Inference Script — Email Triage Environment
 MANDATORY env vars:
 - API_BASE_URL: The API endpoint for the LLM (has default).
 - MODEL_NAME:   The model identifier to use for inference (has default).
-- HF_TOKEN:     Your Hugging Face / API key (required, no default).
+- API_KEY / HF_TOKEN: API key for the LLM proxy (required).
 
 Uses OpenAI Client for all LLM calls.
 Runs all 3 tasks (easy, medium, hard) and prints reproducible scores.
@@ -21,7 +21,8 @@ import os
 import re
 import sys
 import time
-import asyncio
+import urllib.request
+import urllib.error
 from typing import Dict, Any, List
 
 from openai import OpenAI
@@ -73,7 +74,6 @@ Guidelines:
 
 
 def build_user_message(obs: Dict[str, Any]) -> str:
-    """Build the user prompt from an observation."""
     parts = []
     if obs.get("feedback"):
         parts.append(f"[Feedback] {obs['feedback']}")
@@ -88,7 +88,6 @@ def build_user_message(obs: Dict[str, Any]) -> str:
 
 
 def parse_llm_response(text: str) -> Dict[str, Any]:
-    """Extract JSON from LLM response, handling markdown fences."""
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         return json.loads(match.group(1))
@@ -106,7 +105,6 @@ VALID_CATEGORIES = {
 
 
 def sanitize_action(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure action fields are valid."""
     priority = parsed.get("priority", "medium").lower().strip()
     if priority not in VALID_PRIORITIES:
         priority = "medium"
@@ -117,106 +115,103 @@ def sanitize_action(parsed: Dict[str, Any]) -> Dict[str, Any]:
     if len(reply.strip()) == 0:
         reply = "Thank you for your email. We will look into this."
     escalate = bool(parsed.get("escalate", False))
-    return {
-        "priority": priority,
-        "category": category,
-        "reply": reply,
-        "escalate": escalate,
-    }
+    return {"priority": priority, "category": category, "reply": reply, "escalate": escalate}
 
 
 def action_to_str(action: Dict[str, Any]) -> str:
-    """Format action as a compact string for [STEP] output."""
-    p = action["priority"]
-    c = action["category"]
-    e = action["escalate"]
-    # Truncate reply for log readability
+    p, c, e = action["priority"], action["category"], action["escalate"]
     r = action["reply"][:60].replace("\n", " ")
     return f"triage(p={p},c={c},esc={e},reply='{r}...')"
 
 
 # ---------------------------------------------------------------------------
-# WebSocket runner with required output format
+# HTTP helpers for environment interaction (no WebSocket dependency)
 # ---------------------------------------------------------------------------
-import websockets
+
+def env_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST JSON to the environment server via HTTP."""
+    url = f"{ENV_URL}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
-async def ws_run_task(task_id: str) -> Dict[str, Any]:
-    """Run a single task over WebSocket. Returns result dict."""
-    ws_url = ENV_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+# ---------------------------------------------------------------------------
+# Main runner using HTTP REST (stateless per-request)
+# ---------------------------------------------------------------------------
 
-    # [START]
+def run_task(task_id: str) -> Dict[str, Any]:
+    """Run a single task via HTTP and return result dict."""
     print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}")
 
     rewards: List[float] = []
     step_num = 0
     success = False
-    last_error = None
 
     try:
-        async with websockets.connect(ws_url) as ws:
-            # Reset
-            await ws.send(json.dumps({"type": "reset", "data": {"task_id": task_id}}))
-            reset_resp = json.loads(await ws.recv())
-            envelope = reset_resp.get("data", {})
-            obs_inner = envelope.get("observation", {})
-            done = envelope.get("done", False)
+        # Reset — get first email
+        reset_resp = env_post("/reset", {"task_id": task_id})
+        obs = reset_resp.get("observation", {})
+        done = reset_resp.get("done", False)
 
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            while not done and step_num < MAX_STEPS:
-                user_msg = build_user_message(obs_inner)
-                messages.append({"role": "user", "content": user_msg})
+        while not done and step_num < MAX_STEPS:
+            user_msg = build_user_message(obs)
+            messages.append({"role": "user", "content": user_msg})
 
-                # Call LLM
-                error_msg = None
-                try:
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=messages,
-                        temperature=TEMPERATURE,
-                        max_tokens=MAX_TOKENS,
-                    )
-                    llm_text = completion.choices[0].message.content or ""
-                except Exception as e:
+            # Call LLM via OpenAI client (uses API_BASE_URL + API_KEY)
+            error_msg = None
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                llm_text = completion.choices[0].message.content or ""
+            except Exception as e:
+                error_msg = str(e)
+                llm_text = '{"priority":"medium","category":"general_inquiry","reply":"Thank you for your email.","escalate":false}'
+
+            messages.append({"role": "assistant", "content": llm_text})
+
+            # Parse and sanitize
+            try:
+                parsed = parse_llm_response(llm_text)
+            except ValueError as e:
+                if error_msg is None:
                     error_msg = str(e)
-                    llm_text = '{"priority":"medium","category":"general_inquiry","reply":"Thank you for your email.","escalate":false}'
+                parsed = {}
+            action = sanitize_action(parsed)
 
-                messages.append({"role": "assistant", "content": llm_text})
+            # Step the environment via HTTP
+            step_resp = env_post("/step", {"action": action})
+            obs = step_resp.get("observation", {})
+            reward = step_resp.get("reward", 0.0)
+            if reward is None:
+                reward = 0.0
+            done = step_resp.get("done", False)
 
-                # Parse and sanitize
-                try:
-                    parsed = parse_llm_response(llm_text)
-                except ValueError as e:
-                    if error_msg is None:
-                        error_msg = str(e)
-                    parsed = {}
-                action = sanitize_action(parsed)
+            step_num += 1
+            rewards.append(reward)
 
-                # Step the environment
-                await ws.send(json.dumps({"type": "step", "data": action}))
-                step_resp = json.loads(await ws.recv())
-                envelope = step_resp.get("data", {})
-                obs_inner = envelope.get("observation", {})
-                reward = envelope.get("reward", 0.0)
-                if reward is None:
-                    reward = 0.0
-                done = envelope.get("done", False)
+            # [STEP]
+            action_str = action_to_str(action)
+            done_str = "true" if done else "false"
+            error_str = error_msg if error_msg else "null"
+            print(f"[STEP]  step={step_num} action={action_str} reward={reward:.2f} done={done_str} error={error_str}")
 
-                step_num += 1
-                rewards.append(reward)
-
-                # [STEP]
-                action_str = action_to_str(action)
-                done_str = "true" if done else "false"
-                error_str = error_msg if error_msg else "null"
-                print(f"[STEP]  step={step_num} action={action_str} reward={reward:.2f} done={done_str} error={error_str}")
-
-            success = True
+        success = True
 
     except Exception as e:
-        last_error = str(e)
         success = False
+        print(f"[STEP]  step={step_num} action=error reward=0.00 done=true error={e}", file=sys.stderr)
 
     # [END] — always emitted
     success_str = "true" if success else "false"
@@ -229,13 +224,7 @@ async def ws_run_task(task_id: str) -> Dict[str, Any]:
         "steps": step_num,
         "rewards": rewards,
         "final_score": rewards[-1] if rewards else 0.0,
-        "error": last_error,
     }
-
-
-def run_task(task_id: str) -> Dict[str, Any]:
-    """Sync wrapper for ws_run_task."""
-    return asyncio.run(ws_run_task(task_id))
 
 
 def main():
@@ -246,11 +235,10 @@ def main():
         result = run_task(tid)
         results.append(result)
 
-    # Summary (not part of required format, but useful)
+    # Summary
     print()
     for r in results:
-        score = r["final_score"]
-        print(f"  {r['task_id']:20s} : {score:.4f}")
+        print(f"  {r['task_id']:20s} : {r['final_score']:.4f}")
     scores = [r["final_score"] for r in results]
     avg = sum(scores) / len(scores) if scores else 0.0
     print(f"  {'AVERAGE':20s} : {avg:.4f}")
