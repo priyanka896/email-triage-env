@@ -31,10 +31,12 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-if HF_TOKEN is None:
-    raise ValueError("HF_TOKEN environment variable is required")
+# The evaluator injects API_KEY; HF_TOKEN is the fallback for local testing
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
+
+if API_KEY is None:
+    raise ValueError("API_KEY or HF_TOKEN environment variable is required")
 
 ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
 ENV_NAME = "email_triage_env"
@@ -43,7 +45,7 @@ MAX_STEPS = 12
 TEMPERATURE = 0.2
 MAX_TOKENS = 600
 
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 # ---------------------------------------------------------------------------
 # Helpers
