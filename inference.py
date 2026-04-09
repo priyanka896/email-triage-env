@@ -2,18 +2,8 @@
 Inference Script — Email Triage Environment
 ============================================
 
-MANDATORY env vars:
-- API_BASE_URL: The API endpoint for the LLM (has default).
-- MODEL_NAME:   The model identifier to use for inference (has default).
-- API_KEY / HF_TOKEN: API key for the LLM proxy (required).
-
-Uses OpenAI Client for all LLM calls.
+Uses OpenAI Client for all LLM calls via injected env vars.
 Runs all 3 tasks (easy, medium, hard) and prints reproducible scores.
-
-Output format follows hackathon spec:
-  [START] task=<task> env=<env> model=<model>
-  [STEP]  step=<n> action=<str> reward=<0.00> done=<bool> error=<msg|null>
-  [END]   success=<bool> steps=<n> rewards=<r1,r2,...>
 """
 
 import json
@@ -21,22 +11,19 @@ import os
 import re
 import sys
 import time
-import urllib.request
-import urllib.error
 from typing import Dict, Any, List
 
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# Config — env vars with defaults where required
+# Config — use os.environ[] for required vars to fail loudly if missing
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-# The evaluator injects API_KEY; HF_TOKEN is the fallback for local testing
+# Read API_KEY first (evaluator injects this), fall back to HF_TOKEN for local
 API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
-
-if API_KEY is None:
+if not API_KEY:
     raise ValueError("API_KEY or HF_TOKEN environment variable is required")
 
 ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
@@ -46,7 +33,14 @@ MAX_STEPS = 12
 TEMPERATURE = 0.2
 MAX_TOKENS = 600
 
+# Initialize OpenAI client with the injected proxy URL and key
 client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+# Log config for debugging
+print(f"# Config: API_BASE_URL={API_BASE_URL}", file=sys.stderr)
+print(f"# Config: MODEL_NAME={MODEL_NAME}", file=sys.stderr)
+print(f"# Config: ENV_URL={ENV_URL}", file=sys.stderr)
+print(f"# Config: API_KEY={'set' if API_KEY else 'NOT SET'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,93 +119,92 @@ def action_to_str(action: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers for environment interaction (no WebSocket dependency)
+# Environment interaction via WebSocket (stateful sessions)
 # ---------------------------------------------------------------------------
-
-def env_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """POST JSON to the environment server via HTTP."""
-    url = f"{ENV_URL}{path}"
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+import asyncio
+import websockets
 
 
-# ---------------------------------------------------------------------------
-# Main runner using HTTP REST (stateless per-request)
-# ---------------------------------------------------------------------------
+async def ws_run_task(task_id: str) -> Dict[str, Any]:
+    """Run a single task over WebSocket. Returns result dict."""
+    ws_url = ENV_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
 
-def run_task(task_id: str) -> Dict[str, Any]:
-    """Run a single task via HTTP and return result dict."""
     print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}")
+    print(f"# Connecting to {ws_url}", file=sys.stderr)
 
     rewards: List[float] = []
     step_num = 0
     success = False
 
     try:
-        # Reset — get first email
-        reset_resp = env_post("/reset", {"task_id": task_id})
-        obs = reset_resp.get("observation", {})
-        done = reset_resp.get("done", False)
+        async with websockets.connect(ws_url, open_timeout=30, close_timeout=10) as ws:
+            # Reset
+            await ws.send(json.dumps({"type": "reset", "data": {"task_id": task_id}}))
+            reset_resp = json.loads(await ws.recv())
+            envelope = reset_resp.get("data", {})
+            obs = envelope.get("observation", {})
+            done = envelope.get("done", False)
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            print(f"# Reset OK, done={done}, subject={obs.get('email_subject', 'N/A')}", file=sys.stderr)
 
-        while not done and step_num < MAX_STEPS:
-            user_msg = build_user_message(obs)
-            messages.append({"role": "user", "content": user_msg})
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            # Call LLM via OpenAI client (uses API_BASE_URL + API_KEY)
-            error_msg = None
-            try:
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                )
-                llm_text = completion.choices[0].message.content or ""
-            except Exception as e:
-                error_msg = str(e)
-                llm_text = '{"priority":"medium","category":"general_inquiry","reply":"Thank you for your email.","escalate":false}'
+            while not done and step_num < MAX_STEPS:
+                user_msg = build_user_message(obs)
+                messages.append({"role": "user", "content": user_msg})
 
-            messages.append({"role": "assistant", "content": llm_text})
-
-            # Parse and sanitize
-            try:
-                parsed = parse_llm_response(llm_text)
-            except ValueError as e:
-                if error_msg is None:
+                # Call LLM via OpenAI client (uses injected API_BASE_URL + API_KEY)
+                error_msg = None
+                print(f"# Calling LLM for step {step_num + 1}...", file=sys.stderr)
+                try:
+                    completion = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                    )
+                    llm_text = completion.choices[0].message.content or ""
+                    print(f"# LLM responded, length={len(llm_text)}", file=sys.stderr)
+                except Exception as e:
                     error_msg = str(e)
-                parsed = {}
-            action = sanitize_action(parsed)
+                    print(f"# LLM error: {error_msg}", file=sys.stderr)
+                    llm_text = '{"priority":"medium","category":"general_inquiry","reply":"Thank you for your email.","escalate":false}'
 
-            # Step the environment via HTTP
-            step_resp = env_post("/step", {"action": action})
-            obs = step_resp.get("observation", {})
-            reward = step_resp.get("reward", 0.0)
-            if reward is None:
-                reward = 0.0
-            done = step_resp.get("done", False)
+                messages.append({"role": "assistant", "content": llm_text})
 
-            step_num += 1
-            rewards.append(reward)
+                # Parse and sanitize
+                try:
+                    parsed = parse_llm_response(llm_text)
+                except ValueError as e:
+                    if error_msg is None:
+                        error_msg = str(e)
+                    parsed = {}
+                action = sanitize_action(parsed)
 
-            # [STEP]
-            action_str = action_to_str(action)
-            done_str = "true" if done else "false"
-            error_str = error_msg if error_msg else "null"
-            print(f"[STEP]  step={step_num} action={action_str} reward={reward:.2f} done={done_str} error={error_str}")
+                # Step the environment
+                await ws.send(json.dumps({"type": "step", "data": action}))
+                step_resp = json.loads(await ws.recv())
+                envelope = step_resp.get("data", {})
+                obs = envelope.get("observation", {})
+                reward = envelope.get("reward", 0.0)
+                if reward is None:
+                    reward = 0.0
+                done = envelope.get("done", False)
 
-        success = True
+                step_num += 1
+                rewards.append(reward)
+
+                # [STEP]
+                action_str = action_to_str(action)
+                done_str = "true" if done else "false"
+                error_str = error_msg if error_msg else "null"
+                print(f"[STEP]  step={step_num} action={action_str} reward={reward:.2f} done={done_str} error={error_str}")
+
+            success = True
 
     except Exception as e:
+        print(f"# Exception: {type(e).__name__}: {e}", file=sys.stderr)
         success = False
-        print(f"[STEP]  step={step_num} action=error reward=0.00 done=true error={e}", file=sys.stderr)
 
     # [END] — always emitted
     success_str = "true" if success else "false"
@@ -227,15 +220,17 @@ def run_task(task_id: str) -> Dict[str, Any]:
     }
 
 
+def run_task(task_id: str) -> Dict[str, Any]:
+    return asyncio.run(ws_run_task(task_id))
+
+
 def main():
     task_ids = ["easy_triage", "medium_triage", "hard_triage"]
     results = []
-
     for tid in task_ids:
         result = run_task(tid)
         results.append(result)
 
-    # Summary
     print()
     for r in results:
         print(f"  {r['task_id']:20s} : {r['final_score']:.4f}")
