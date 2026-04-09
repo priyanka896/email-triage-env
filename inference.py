@@ -26,7 +26,7 @@ API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 if not API_KEY:
     raise ValueError("API_KEY or HF_TOKEN environment variable is required")
 
-ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
+ENV_URL = os.getenv("ENV_URL", "https://priya8596-email-triage-env.hf.space")
 ENV_NAME = "email_triage_env"
 
 MAX_STEPS = 12
