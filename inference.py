@@ -128,14 +128,9 @@ def main():
 
         # Call LLM — this MUST go through the proxy
         error_msg = "null"
-        try:
-            llm_text = call_llm(messages)
-            parsed = parse_llm_response(llm_text)
-            action = sanitize_action(parsed)
-        except Exception as e:
-            error_msg = str(e)
-            print(f"# LLM call error: {e}", file=sys.stderr)
-            action = {"priority": "medium", "category": "general_inquiry", "reply": "Thank you.", "escalate": False}
+        llm_text = call_llm(messages)
+        parsed = parse_llm_response(llm_text)
+        action = sanitize_action(parsed)
 
         step_num += 1
         reward = 0.50  # default reward for stateless mode
