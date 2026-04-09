@@ -21,21 +21,14 @@ API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
 if not API_KEY:
     raise ValueError("API_KEY or HF_TOKEN environment variable is required")
 
-ENV_URL = os.environ.get("ENV_URL", "https://priya8596-email-triage-env.hf.space")
+ENV_URL = os.environ.get("ENV_URL", "http://localhost:7860")
 ENV_NAME = "email_triage_env"
 TEMPERATURE = 0.2
 MAX_TOKENS = 600
 
-# Also create OpenAI client if available (preferred)
-try:
-    from openai import OpenAI
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    USE_OPENAI_CLIENT = True
-    print("# Using OpenAI client", file=sys.stderr)
-except ImportError:
-    client = None
-    USE_OPENAI_CLIENT = False
-    print("# OpenAI not installed, using raw HTTP", file=sys.stderr)
+# Client will be created in main() to ensure env vars are read at runtime
+client = None
+USE_OPENAI_CLIENT = False
 
 print(f"# API_BASE_URL={API_BASE_URL}", file=sys.stderr)
 print(f"# MODEL_NAME={MODEL_NAME}", file=sys.stderr)
@@ -137,6 +130,35 @@ def sanitize(parsed):
 # ---------------------------------------------------------------------------
 
 def main():
+    global client, USE_OPENAI_CLIENT
+
+    # Re-read env vars at runtime (in case they were set after import)
+    api_base = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+    api_key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
+    model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+
+    if not api_key:
+        raise ValueError("API_KEY or HF_TOKEN required")
+
+    print(f"# main() API_BASE_URL={api_base}", file=sys.stderr)
+    print(f"# main() MODEL_NAME={model}", file=sys.stderr)
+    print(f"# main() API_KEY set={bool(api_key)}", file=sys.stderr)
+
+    # Create OpenAI client at runtime
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=api_base, api_key=api_key)
+        USE_OPENAI_CLIENT = True
+        print("# Using OpenAI client", file=sys.stderr)
+    except ImportError:
+        USE_OPENAI_CLIENT = False
+        print("# OpenAI not installed, using raw HTTP", file=sys.stderr)
+
+    # Override globals so call_llm uses correct values
+    globals()["API_BASE_URL"] = api_base
+    globals()["API_KEY"] = api_key
+    globals()["MODEL_NAME"] = model
+
     current_task = None
     step_num = 0
     task_rewards = []
