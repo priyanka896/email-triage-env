@@ -16,11 +16,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 COPY email_triage_env/pyproject.toml ./
 COPY email_triage_env/ ./email_triage_env/
 COPY email_triage_env/openenv.yaml ./
+COPY inference.py ./
+COPY requirements.txt ./
 
-# Install dependencies
+# Install dependencies (includes openai)
 RUN uv venv /app/.venv && \
     . /app/.venv/bin/activate && \
-    uv pip install -e "."
+    uv pip install -e "." && \
+    uv pip install openai websockets
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app:$PYTHONPATH"
