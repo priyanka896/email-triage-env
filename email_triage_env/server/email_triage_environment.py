@@ -77,6 +77,12 @@ class EmailTriageEnvironment(Environment):
         email = self._task.emails[0]
         return EmailObservation(
             task_id=self._task.task_id,
+            prompt=(
+                f"You are an email triage agent. Classify this email by priority "
+                f"(urgent/high/medium/low), category (bug_report/feature_request/"
+                f"billing/account_access/general_inquiry/spam), draft a reply, "
+                f"and decide whether to escalate. Respond with JSON."
+            ),
             email_from=email.sender,
             email_subject=email.subject,
             email_body=email.body,
@@ -85,7 +91,7 @@ class EmailTriageEnvironment(Environment):
             feedback=f"Task: {self._task.description}",
             emails_remaining=len(self._task.emails),
             done=False,
-            reward=None,
+            reward=0.0,
         )
 
     def step(

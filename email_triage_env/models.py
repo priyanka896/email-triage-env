@@ -49,6 +49,7 @@ class EmailObservation(Observation):
     """What the agent sees: the current email and triage context."""
 
     task_id: str = Field(default="", description="Current task identifier")
+    prompt: str = Field(default="", description="Instructions for the agent")
     email_from: str = Field(default="", description="Sender address")
     email_subject: str = Field(default="", description="Email subject line")
     email_body: str = Field(default="", description="Email body text")
