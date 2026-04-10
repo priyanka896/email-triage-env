@@ -101,7 +101,7 @@ class EmailTriageEnvironment(Environment):
             return EmailObservation(
                 feedback="Environment not initialized. Call reset() first.",
                 done=True,
-                reward=0.0,
+                reward=0.001,
             )
 
         idx = self._state.current_email_index
@@ -112,7 +112,7 @@ class EmailTriageEnvironment(Environment):
             return EmailObservation(
                 feedback="All emails already processed.",
                 done=True,
-                reward=avg,
+                reward=max(0.001, min(avg, 0.999)),
             )
 
         # Grade current email
@@ -122,7 +122,7 @@ class EmailTriageEnvironment(Environment):
 
         # Penalize clearly bad behaviour
         if len(action.reply.split()) < 3:
-            reward = max(reward - 0.1, 0.0)
+            reward = max(reward - 0.1, 0.001)
 
         self._state.step_count += 1
         self._state.current_email_index += 1
@@ -176,7 +176,7 @@ class EmailTriageEnvironment(Environment):
             feedback=f"Previous email scored {reward:.4f}.",
             emails_remaining=remaining,
             done=False,
-            reward=reward,
+            reward=max(0.001, min(reward, 0.999)),
         )
 
     @property
