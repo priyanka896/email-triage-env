@@ -100,8 +100,27 @@ class EmailTriageEnvironment(Environment):
         timeout_s: Optional[float] = None,
         **kwargs: Any,
     ) -> Observation:
-        if not isinstance(action, EmailAction):
-            raise ValueError(f"Expected EmailAction, got {type(action)}")
+        # Accept any action format - try to extract fields
+        if isinstance(action, EmailAction):
+            email_action = action
+        else:
+            # Try to convert generic action to EmailAction
+            try:
+                action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+                from ..models import Priority, Category
+                email_action = EmailAction(
+                    priority=Priority(action_dict.get("priority", "medium")),
+                    category=Category(action_dict.get("category", "general_inquiry")),
+                    reply=str(action_dict.get("reply", action_dict.get("answer", action_dict.get("message", "Thank you.")))),
+                    escalate=bool(action_dict.get("escalate", False)),
+                )
+            except Exception:
+                email_action = EmailAction(
+                    priority=Priority.MEDIUM,
+                    category=Category.GENERAL_INQUIRY,
+                    reply="Thank you for your email.",
+                    escalate=False,
+                )
 
         if self._task is None:
             return EmailObservation(
@@ -123,11 +142,11 @@ class EmailTriageEnvironment(Environment):
 
         # Grade current email
         gold = self._task.emails[idx]
-        reward = grade_single_email(action, gold)
+        reward = grade_single_email(email_action, gold)
         self._scores.append(reward)
 
         # Penalize clearly bad behaviour
-        if len(action.reply.split()) < 3:
+        if len(email_action.reply.split()) < 3:
             reward = max(reward - 0.1, 0.001)
 
         self._state.step_count += 1
