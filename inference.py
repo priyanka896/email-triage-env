@@ -1,146 +1,164 @@
 """
-Inference Script for Email Triage Environment
+Inference Script — Email Triage Environment
+============================================
+Mandatory STDOUT format:
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 import os
 import json
 import re
 import sys
-import urllib.request
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from openai import OpenAI
 
-# Read environment variables with defaults where required
+# Import environment directly (in-process, no HTTP)
+from email_triage_env.server.email_triage_environment import EmailTriageEnvironment
+from email_triage_env.models import EmailAction, Priority, Category
+
+# ── Environment Variables ──
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 
-if HF_TOKEN is None:
-    raise ValueError("HF_TOKEN environment variable is required")
+if not API_KEY:
+    raise EnvironmentError("API_KEY or HF_TOKEN environment variable is required.")
 
-# Initialize OpenAI client
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-ENV_URL = os.getenv("ENV_URL", "https://priya8596-email-triage-env.hf.space")
 ENV_NAME = "email_triage_env"
+MAX_STEPS = 10
+
+
+# ── Logging helpers ──
+
+def log_start(task, env, model):
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+def log_step(step, action, reward, done, error=None):
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(f"[STEP]  step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+def log_end(success, steps, score, rewards):
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END]   success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+
+
+# ── LLM + parsing ──
 
 SYSTEM_PROMPT = """You are an email triage agent. For each email, respond with ONLY a JSON object:
 {"priority": "urgent|high|medium|low", "category": "bug_report|feature_request|billing|account_access|general_inquiry|spam", "reply": "your professional reply", "escalate": true|false}"""
 
-
-def env_post(path, body):
-    """POST to environment server."""
-    url = ENV_URL + path
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        print(f"# env_post {path} error: {e}", file=sys.stderr)
-        return None
-
-
-def call_llm(prompt):
-    """Call LLM and return response text."""
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=600,
-    )
-    return response.choices[0].message.content
+VALID_P = {"urgent", "high", "medium", "low"}
+VALID_C = {"bug_report", "feature_request", "billing", "account_access", "general_inquiry", "spam"}
 
 
 def parse_action(text):
-    """Parse JSON action from LLM response."""
     m = re.search(r"\{.*\}", text or "", re.DOTALL)
     if m:
         try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
+            data = json.loads(m.group(0))
+            p = data.get("priority", "medium").lower().strip()
+            c = data.get("category", "general_inquiry").lower().strip()
+            r = str(data.get("reply", "Thank you."))[:2000] or "Thank you."
+            e = bool(data.get("escalate", False))
+            if p not in VALID_P: p = "medium"
+            if c not in VALID_C: c = "general_inquiry"
+            return EmailAction(priority=Priority(p), category=Category(c), reply=r, escalate=e)
+        except Exception:
             pass
-    return {"priority": "medium", "category": "general_inquiry", "reply": "Thank you.", "escalate": False}
+    return EmailAction(priority=Priority.MEDIUM, category=Category.GENERAL_INQUIRY, reply="Thank you for your email.", escalate=False)
 
 
-def sanitize(parsed):
-    """Ensure action fields are valid."""
-    VALID_P = {"urgent", "high", "medium", "low"}
-    VALID_C = {"bug_report", "feature_request", "billing", "account_access", "general_inquiry", "spam"}
-    p = parsed.get("priority", "medium").lower().strip()
-    c = parsed.get("category", "general_inquiry").lower().strip()
-    r = str(parsed.get("reply", "Thank you."))[:2000] or "Thank you."
-    e = bool(parsed.get("escalate", False))
-    if p not in VALID_P: p = "medium"
-    if c not in VALID_C: c = "general_inquiry"
-    return {"priority": p, "category": c, "reply": r, "escalate": e}
+# ── Task runner ──
 
+def run_task(env, task_id):
+    log_start(task=task_id, env=ENV_NAME, model=MODEL_NAME)
 
-TASKS = ["easy_triage", "medium_triage", "hard_triage"]
+    rewards = []
+    steps_taken = 0
+    score = 0.01
+    success = False
 
-if __name__ == "__main__":
-    for task_id in TASKS:
-        print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}")
+    try:
+        obs = env.reset(task_id=task_id)
+        print(f"# reset: done={obs.done}, task={obs.task_id}, remaining={obs.emails_remaining}, _task={env._task is not None}", file=sys.stderr)
 
-        # Reset environment
-        reset_resp = env_post("/reset", {"task_id": task_id})
-
-        step_num = 0
-        task_rewards = []
-        done = False
-
-        if reset_resp:
-            obs = reset_resp.get("observation", {})
-            done = reset_resp.get("done", False)
-        else:
-            obs = {}
-            done = True
-
-        while not done and step_num < 10:
+        for step in range(1, MAX_STEPS + 1):
             # Build prompt from observation
-            parts = []
-            if obs.get("email_subject"):
-                parts.append(f"Subject: {obs['email_subject']}")
-            if obs.get("email_body"):
-                parts.append(f"Body: {obs['email_body']}")
-            if obs.get("feedback"):
-                parts.append(f"Feedback: {obs['feedback']}")
-            prompt = "\n".join(parts) if parts else "Triage this email."
+            prompt = f"Subject: {obs.email_subject}\nBody:\n{obs.email_body}"
+            if obs.history:
+                prompt = f"Thread History:\n" + "\n".join(obs.history) + "\n\n" + prompt
+            if obs.feedback:
+                prompt = f"Feedback: {obs.feedback}\n\n" + prompt
 
             # Call LLM
-            llm_text = call_llm(prompt)
-            action = sanitize(parse_action(llm_text))
+            last_error = None
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=600,
+                )
+                llm_text = completion.choices[0].message.content or ""
+            except Exception as e:
+                last_error = str(e)
+                log_step(step=step, action="error", reward=0.01, done=True, error=last_error)
+                rewards.append(0.01)
+                steps_taken = step
+                break
 
-            # Step environment
-            step_resp = env_post("/step", {"action": action})
+            action = parse_action(llm_text)
+            action_str = f"triage(p={action.priority.value},c={action.category.value},esc={action.escalate})"
 
-            reward = 0.5
-            if step_resp:
-                reward = step_resp.get("reward", 0.5) or 0.5
-                obs = step_resp.get("observation", {})
-                done = step_resp.get("done", False)
-            else:
-                done = True
+            # Step environment (in-process)
+            obs = env.step(action)
+            print(f"# step result: done={obs.done}, reward={obs.reward}, task={obs.task_id}, remaining={obs.emails_remaining}, feedback={obs.feedback[:50] if obs.feedback else 'none'}", file=sys.stderr)
+            reward = float(obs.reward) if obs.reward is not None else 0.01
+            reward = max(0.01, min(0.99, reward))
+            done = obs.done
 
-            # Clamp reward to strict (0, 1)
-            reward = max(0.01, min(float(reward), 0.99))
+            rewards.append(reward)
+            steps_taken = step
 
-            step_num += 1
-            task_rewards.append(reward)
+            log_step(step=step, action=action_str, reward=reward, done=done, error=last_error)
 
-            p = action["priority"]
-            c = action["category"]
-            e = action["escalate"]
-            r = action["reply"][:60].replace("\n", " ")
-            done_str = "true" if done else "false"
-            print(f"[STEP]  step={step_num} action=triage(p={p},c={c},esc={e},reply='{r}...') reward={reward:.2f} done={done_str} error=null")
+            if done:
+                break
 
-        if not task_rewards:
-            task_rewards = [0.5]
+        # Compute task score
+        if rewards:
+            raw_score = rewards[-1]  # Final reward is the task average
+        else:
+            raw_score = 0.01
+        score = max(0.01, min(0.99, raw_score))
+        success = score > 0.5
 
-        rewards_str = ",".join(f"{r:.2f}" for r in task_rewards)
-        print(f"[END]   success=true steps={step_num} rewards={rewards_str}")
+    except Exception as e:
+        score = 0.01
+        success = False
+        print(f"# Error: {e}", file=sys.stderr)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
+
+
+def main():
+    env = EmailTriageEnvironment()
+    tasks = ["easy_triage", "medium_triage", "hard_triage"]
+    for task_id in tasks:
+        run_task(env, task_id)
+
+
+if __name__ == "__main__":
+    main()
