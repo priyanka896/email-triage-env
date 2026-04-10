@@ -85,7 +85,7 @@ class EmailTriageEnvironment(Environment):
             feedback=f"Task: {self._task.description}",
             emails_remaining=len(self._task.emails),
             done=False,
-            reward=0.0,
+            reward=0.001,
         )
 
     def step(
@@ -148,7 +148,7 @@ class EmailTriageEnvironment(Environment):
                 if improving >= len(self._scores) - 1:
                     bonus += 0.03
 
-            final_score = min(avg + bonus, 1.0)
+            final_score = max(0.001, min(avg + bonus, 0.999))
 
             return EmailObservation(
                 task_id=self._task.task_id,

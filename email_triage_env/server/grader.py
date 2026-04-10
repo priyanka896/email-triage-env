@@ -137,4 +137,4 @@ def grade_single_email(action: EmailAction, gold: Email) -> float:
     quality = _score_reply_quality(action.reply)
     score += 0.20 * quality
 
-    return round(min(score, 1.0), 4)
+    return round(max(0.001, min(score, 0.999)), 4)
