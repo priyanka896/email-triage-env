@@ -85,7 +85,7 @@ class EmailTriageEnvironment(Environment):
             feedback=f"Task: {self._task.description}",
             emails_remaining=len(self._task.emails),
             done=False,
-            reward=0.001,
+            reward=None,
         )
 
     def step(
